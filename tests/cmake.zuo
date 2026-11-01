@@ -1,0 +1,51 @@
+#lang zuo
+
+(require "../zuokit.zuo")
+
+(define time (current-time))
+(define base (build-path (hash-ref (runtime-env) 'dir) "build"
+                         (~a "cmake test-" (car time) "-" (cdr time))))
+(define (check x message) (unless x (error message)))
+(define (put p text) (mkdir-p (path-only p)) (display-to-file text p :truncate))
+(define (count p) (length (filter (lambda (s) (not (equal? s ""))) (string-split (file->string p) "\n"))))
+
+;; No compiler or downloaded package: the delegated project copies one input.
+(define source (build-path base "cmake source"))
+(define binary (build-path base "cmake build"))
+(define prefix (build-path base "install area"))
+(define script (build-path source "CMakeLists.txt"))
+(put (build-path source "input.txt") "first")
+(put script
+  "cmake_minimum_required(VERSION 3.20)\nproject(probe LANGUAGES NONE)\nfile(APPEND \"${CMAKE_BINARY_DIR}/configured.log\" \"configured\\n\")\nfile(GENERATE OUTPUT \"${CMAKE_BINARY_DIR}/setting.txt\" CONTENT \"${SETTING}|${FLAG}\")\nadd_custom_command(OUTPUT \"${CMAKE_BINARY_DIR}/generated.txt\" COMMAND \"${CMAKE_COMMAND}\" -E copy \"${CMAKE_SOURCE_DIR}/input.txt\" \"${CMAKE_BINARY_DIR}/generated.txt\" DEPENDS \"${CMAKE_SOURCE_DIR}/input.txt\")\nadd_custom_target(asset ALL DEPENDS \"${CMAKE_BINARY_DIR}/generated.txt\")\ninstall(FILES \"${CMAKE_BINARY_DIR}/generated.txt\" \"${CMAKE_BINARY_DIR}/setting.txt\" DESTINATION share)\n")
+(define (project setting)
+  (cmake-project source binary 'generator "Ninja" 'prefix prefix 'define (hash 'SETTING setting 'FLAG #f)))
+(build (project "a"))
+(check (equal? (file->string (build-path prefix "share/generated.txt")) "first") "cmake install failed")
+(check (equal? (file->string (build-path prefix "share/setting.txt")) "a|OFF") "cmake definitions failed")
+(build (project "a"))
+(check (= (count (build-path binary "configured.log")) 1) "unchanged cmake configuration reran")
+;; CMake's install timestamp comparison needs distinct seconds on this host.
+(fd-poll '() 1100)
+(put (build-path source "input.txt") "second")
+(build (project "a"))
+(check (equal? (file->string (build-path prefix "share/generated.txt")) "second") "outer cache skipped inner incremental build")
+(fd-poll '() 1100)
+(build (project "b"))
+(check (= (count (build-path binary "configured.log")) 2) "cmake configuration change was ignored")
+(check (equal? (file->string (build-path prefix "share/setting.txt")) "b|OFF") "cmake did not install new configuration")
+(define generated-source (build-path base "generated cmake source"))
+(define source-target
+  (target generated-source
+    (lambda (path token)
+      (rule '() (lambda () (put (build-path generated-source "CMakeLists.txt")
+                                "cmake_minimum_required(VERSION 3.20)\nproject(generated LANGUAGES NONE)\n")
+                           (string-sha256 "source"))
+            (if (file-exists? (build-path generated-source "CMakeLists.txt")) (string-sha256 "source") no-sha256)))
+    (hash 'db-dir base 'precious? #t)))
+(define generated-project (cmake-project generated-source (build-path base "generated build")
+                                        'generator "Ninja" 'needs (list source-target)))
+(build generated-project #f (hash 'dry-run-mode 'dry-run))
+(check (not (directory-exists? generated-source)) "cmake dry run prepared source")
+(build generated-project)
+(check (file-exists? (build-path base "generated build/CMakeCache.txt")) "cmake ran before source materialization")
+(displayln "zuokit CMake: configuration, incremental builds, installation and source dependencies passed")

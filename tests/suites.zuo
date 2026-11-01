@@ -1,0 +1,17 @@
+#lang zuo
+
+(require "../zuokit.zuo")
+(provide tests)
+
+(define zuo (hash-ref (runtime-env) 'exe))
+(define root (simple-form-path (build-path (path-only (quote-module-path)) "..")))
+(define tests
+  (suite
+    (map (lambda (name)
+           (list name (cmd 'dir root $zuo ($ (build-path root "tests" (~a name ".zuo"))))))
+         '(deps build cmake chez runner))))
+
+(module+ main
+  (define result (test-run (quote-module-path) 'names (hash-ref (runtime-env) 'args)))
+  (report result)
+  (exit (hash-ref result 'exit-code)))

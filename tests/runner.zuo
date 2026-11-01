@@ -1,0 +1,145 @@
+#lang zuo
+
+(require "../zuokit.zuo")
+(provide tests benchmarks cycles invalid-defaults configured)
+(define self (quote-module-path))
+(define zuo (hash-ref (runtime-env) 'exe))
+(define (emit text code) (cmd $zuo $self emit $text $code))
+(define tests
+  (test-suite
+    [nested (test-suite [thunk (lambda () (displayln "thunk ran"))]
+                        [command (emit "a value with spaces 中文" 0)] 'tags '(inner)) 'tags '(nested)]
+    [same (diff (emit "same\r\n" 0) (emit "same\r\n" 0))]
+    [different (diff (emit "left" 0) (emit "right" 0))]
+    [both-fail (diff (emit "same" 7) (emit "same" 7))]
+    [compare (diff (emit "left" 0) (emit "right" 0)
+                   'compare (lambda (expected actual) (cmd $zuo $self compare $expected $actual)))]
+    [failed (emit "failed" 3)]
+    [crashed (lambda () (error "deliberate runtime error"))]
+    [early-exit (lambda () (exit 0))]
+    [missing (cmd zuokit-this-executable-does-not-exist)]
+    [expected-exit (emit "expected" 7) 'exit 7]
+    [skip (emit "skip" 77) 'skip-exit 77]
+    [prerequisite (test-suite [failed (emit "setup failed" 9)] [independent (emit "ok" 0)])]
+    [dependent (lambda () (error "blocked body must not run")) 'needs '(prerequisite)]
+    [after (emit "still running" 0)]))
+(define (configured config)
+  (when (hash-ref config 'literal #f)
+    (check (equal? (hash-ref config 'literal) '(zuokit-map (a 1))) "configuration tag collision")
+    (check (equal? (hash-ref config 'pair) (cons 'left (hash 'right 2))) "configuration lost a dotted pair"))
+  (suite (map (lambda (name) (list name (emit (hash-ref config 'message) 0))) (hash-ref config 'names))))
+(define cycles
+  (test-suite [a void 'needs '(b)] [b void 'needs '(a)]))
+(define invalid-defaults
+  (test-suite [a void] 'defaults (hash 'timeout-ms 10)))
+(define benchmarks
+  (bench-suite
+    [deterministic (batch (lambda (n) (* n 1000000)))
+                   'target-ms 4 'warmup 2 'samples 15]
+    [ordered
+     (defer (lambda ()
+              (define worker (process zuo self "sampler" (hash 'stdin 'pipe 'stdout 'pipe)))
+              (batch (lambda (n)
+                       (fd-write (hash-ref worker 'stdin) "x")
+                       (* 1000000 (string->integer (fd-read (hash-ref worker 'stdout) 1)))))))
+     'target-ms 1 'warmup 0 'samples 4]
+    [defaults
+     (bench-suite
+       [inherited (batch (lambda (n) (* n 1000000)))]
+       [override (batch (lambda (n) (* n 1000000))) 'target-ms 2 'samples 3])
+     'defaults (hash 'target-ms 4 'warmup 1 'samples 5)]
+    [malformed (measured (lambda (n path) (cmd $zuo $self sample malformed $n $path)))]
+    [missing (measured (lambda (n path) (emit "no result" 0)))]
+    [failed (measured (lambda (n path) (emit "failed measurement" 3)))]
+    [negative (batch (lambda (n) -1))]
+    [zero (batch (lambda (n) 0)) 'max-n 4]
+    [crashed (batch (lambda (n) (error "benchmark runtime error")))]
+    [measured (measured (lambda (n path) (cmd $zuo $self sample valid $n $path)))
+              'target-ms 4 'warmup 0 'samples 3]
+    [after (batch (lambda (n) (* n 1000000))) 'target-ms 1 'warmup 0 'samples 1]))
+
+(define (check x message) (unless x (error message)))
+(define (find-case result name)
+  (car (filter (lambda (r) (equal? (hash-ref r 'name) name)) (hash-ref result 'cases))))
+(module+ main
+  (define args (hash-ref (runtime-env) 'args))
+  (cond
+    [(and (pair? args) (equal? (car args) "emit"))
+     (display (cadr args)) (exit (string->integer (list-ref args 2)))]
+    [(and (pair? args) (equal? (car args) "compare"))
+     (check (equal? (file->string (cadr args)) "left") "wrong expected file")
+     (check (equal? (file->string (list-ref args 2)) "right") "wrong actual file")]
+    [(and (pair? args) (equal? (car args) "sample"))
+     (display-to-file (if (equal? (cadr args) "valid") (~a (* (string->integer (list-ref args 2)) 1000000)) "(")
+                      (list-ref args 3))]
+    [(and (pair? args) (equal? (car args) "sampler"))
+     (define input (fd-open-input 'stdin))
+     (define output (fd-open-output 'stdout))
+     (for-each (lambda (value) (fd-read input 1) (fd-write output value)) '("2" "7" "1" "4" "2"))]
+    [(and (pair? args) (equal? (car args) "cycle")) (void (test-run self 'export 'cycles))]
+    [(and (pair? args) (equal? (car args) "invalid-defaults")) (void (test-run self 'export 'invalid-defaults))]
+    [(and (pair? args) (equal? (car args) "duplicate-suite")) (void (suite (list (list 'same void) (list "same" void))))]
+    [(and (pair? args) (equal? (car args) "invalid-suite-name")) (void (suite (list (list "bad/name" void))))]
+    [else
+     (define tested (test-run self))
+     (void (map (lambda (name expected)
+                 (check (eq? (hash-ref (find-case tested name) 'status) expected) (~a "unexpected status for " name)))
+               '("nested/thunk" "nested/command" "same" "different" "both-fail" "compare" "failed" "crashed"
+                 "early-exit" "missing" "expected-exit" "skip" "prerequisite/failed" "prerequisite/independent" "dependent" "after")
+               '(passed passed passed failed failed passed failed error error error passed skipped failed passed blocked passed)))
+     (check (= (hash-ref tested 'exit-code) 1) "test failure did not affect exit-code")
+     (check (equal? (file->string (build-path (hash-ref (find-case tested "nested/command") 'directory) "stdout"))
+                    "a value with spaces 中文") "command output was decorated")
+     (check (not (equal? (file->string (build-path (hash-ref (find-case tested "crashed") 'directory) "stderr")) ""))
+            "runtime diagnostic was lost")
+     (define selected (test-run self 'names '(nested)))
+     (check (= (length (hash-ref selected 'cases)) 2) "nested suite selection failed")
+     (check (= (hash-ref selected 'exit-code) 0) "successful suite failed")
+     (define configured-run (test-run self 'export 'configured
+                                      'config (hash 'message "config 中文" 'names '(first second)
+                                                    'literal '(zuokit-map (a 1)) 'pair (cons 'left (hash 'right 2)))))
+     (check (= (length (hash-ref configured-run 'cases)) 2) "dynamic names were not preserved in workers")
+     (check (equal? (file->string (build-path (hash-ref (find-case configured-run "second") 'directory) "stdout")) "config 中文")
+            "worker did not receive explicit configuration")
+     (define generated-targets
+       (suite-targets self 'export 'configured 'config (hash 'message "from target" 'names '(generated))
+                      'groups (hash 'all-generated (hash)) 'db-dir (hash-ref tested 'directory)))
+     (build (car (filter (lambda (t) (eq? (target-name t) 'all-generated)) generated-targets)))
+     (define tagged (test-run self 'tags '(nested)))
+     (check (= (length (hash-ref tagged 'cases)) 2) "inherited tag selection failed")
+     (define inner (test-run self 'tags '(inner)))
+     (check (= (length (hash-ref inner 'cases)) 2) "suite and entry tags did not accumulate")
+     (define dependency (test-run self 'names '(dependent)))
+     (check (= (length (hash-ref dependency 'cases)) 3) "suite dependency closure failed")
+     (define supervised (test-run self 'names '(nested) 'supervise (lambda (argv) (cmd @argv))))
+     (check (= (hash-ref supervised 'exit-code) 0) "explicit supervisor failed")
+     (define log (fd-open-output (build-path (hash-ref tested 'directory) "cycle.stderr") :error))
+     (check (not (= (run 'check? #f 'stderr log $zuo $self cycle) 0)) "dependency cycle accepted")
+     (check (not (= (run 'check? #f 'stderr log $zuo $self invalid-defaults) 0)) "unknown child defaults silently accepted")
+     (check (not (= (run 'check? #f 'stderr log $zuo $self duplicate-suite) 0)) "duplicate suite name accepted")
+     (check (not (= (run 'check? #f 'stderr log $zuo $self invalid-suite-name) 0)) "invalid suite name accepted")
+     (fd-close log)
+     (define benched (bench-run self))
+     (define fixed (find-case benched "deterministic"))
+     (define ordered (find-case benched "ordered"))
+     (check (= (hash-ref ordered 'min-ns) 1000000) "min did not sort samples")
+     (check (= (hash-ref ordered 'median-ns) 3000000) "even median did not average the middle pair")
+     (check (= (hash-ref ordered 'p90-ns) 7000000) "p90 did not use nearest rank")
+     (define inherited (find-case benched "defaults/inherited"))
+     (define override (find-case benched "defaults/override"))
+     (check (= (hash-ref inherited 'n) 4) "suite defaults did not reach child")
+     (check (= (length (hash-ref inherited 'samples-ns)) 5) "default sample count lost")
+     (check (= (length (hash-ref override 'samples-ns)) 3) "child could not override defaults")
+     (check (= (hash-ref override 'n) 2) "child target override failed")
+     (check (= (hash-ref fixed 'n) 4) "calibration did not double N")
+     (check (equal? (hash-ref fixed 'calibration) '((1 1000000) (2 2000000) (4 4000000))) "calibration history lost")
+     (check (= (length (hash-ref fixed 'warmup-ns)) 2) "wrong warmup count")
+     (check (= (length (hash-ref fixed 'samples-ns)) 15) "wrong sample count")
+     (for-each (lambda (key) (check (= (hash-ref fixed key) 1000000) "incorrect statistics")) '(min-ns median-ns p90-ns))
+     (for-each (lambda (name)
+                 (check (eq? (hash-ref (find-case benched name) 'status) 'error) (~a "benchmark error escaped isolation: " name)))
+               '("malformed" "missing" "failed" "negative" "zero" "crashed"))
+     (check (eq? (hash-ref (find-case benched "measured") 'status) 'passed) "reported sample failed")
+     (check (eq? (hash-ref (find-case benched "after") 'status) 'passed) "benchmark stopped after failure")
+     (report benched)
+     (displayln "zuokit runner: nesting, selection, dependencies, diff, isolation and benchmark protocol passed")]))
